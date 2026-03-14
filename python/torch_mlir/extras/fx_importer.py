@@ -170,6 +170,8 @@ OPTIONAL_TORCH_DTYPE_TO_MLIR_TYPE_ASM = {
     "float8_e4m3fn": "f8E4M3FN",
     "float8_e5m2fnuz": "f8E5M2FNUZ",
     "float8_e4m3fnuz": "f8E4M3FNUZ",
+    "float8_e8m0fnu": "ui8",
+    "float4_e2m1fn_x2": "ui8",
 }
 for dtype_str, dtype_asm in OPTIONAL_TORCH_DTYPE_TO_MLIR_TYPE_ASM.items():
     if hasattr(torch, dtype_str):
@@ -198,6 +200,8 @@ OPTIONAL_TORCH_DTYPE_TO_MLIR_TYPE = {
     "float8_e4m3fn": lambda: Float8E4M3FNType.get(),
     "float8_e5m2fnuz": lambda: Float8E5M2FNUZType.get(),
     "float8_e4m3fnuz": lambda: Float8E4M3FNUZType.get(),
+    "float8_e8m0fnu": lambda: IntegerType.get_unsigned(8),
+    "float4_e2m1fn_x2": lambda: IntegerType.get_unsigned(8),
 }
 for dtype_str, mlir_type in OPTIONAL_TORCH_DTYPE_TO_MLIR_TYPE.items():
     if hasattr(torch, dtype_str):
@@ -225,6 +229,12 @@ if ml_dtypes is not None:
     TORCH_DTYPE_TO_NPY_TYPE[torch.float8_e4m3fn] = ml_dtypes.float8_e4m3fn
     TORCH_DTYPE_TO_NPY_TYPE[torch.float8_e5m2fnuz] = ml_dtypes.float8_e5m2fnuz
     TORCH_DTYPE_TO_NPY_TYPE[torch.float8_e4m3fnuz] = ml_dtypes.float8_e4m3fnuz
+else:
+    TORCH_DTYPE_TO_NPY_TYPE[torch.bfloat16] = np.int16
+
+for byte_transport_dtype in ("float8_e8m0fnu", "float4_e2m1fn_x2"):
+    if hasattr(torch, byte_transport_dtype):
+        TORCH_DTYPE_TO_NPY_TYPE[getattr(torch, byte_transport_dtype)] = np.uint8
 
 TORCH_DTYPE_TO_INT = {
     torch.uint8: 0,
@@ -250,6 +260,7 @@ OPTIONAL_TORCH_DTYPE_TO_INT = {
     "float8_e4m3fn": 24,
     "float8_e5m2fnuz": 25,
     "float8_e4m3fnuz": 26,
+    "float8_e8m0fnu": 27,
 }
 for dtype_str, dtype_int in OPTIONAL_TORCH_DTYPE_TO_INT.items():
     if hasattr(torch, dtype_str):
@@ -1712,6 +1723,59 @@ class GraphNodeImporter:
             )
         handler(loc, node, hop)
 
+    def _import_hop_out_dtype(
+        self, loc: Location, node: torch_fx.Node, hop: HigherOrderOperator
+    ):
+        # Imports higher_order.out_dtype(op_overload, dtype, *args) by emitting
+        # the wrapped op directly and using the HOP node metadata for result types.
+        if len(node.args) < 2:
+            raise NotImplementedError(
+                f"Malformed out_dtype HOP node: expected at least 2 args, got {len(node.args)}"
+            )
+
+        wrapped_op = node.args[0]
+        wrapped_args = tuple(node.args[2:])
+        if not isinstance(wrapped_op, TorchOpOverload):
+            raise NotImplementedError(
+                f"out_dtype currently expects arg0 to be a TorchOpOverload, got {type(wrapped_op)}"
+            )
+
+        schema = wrapped_op._schema
+        assert isinstance(schema, FunctionSchema)
+        mlir_op_name = _get_mlir_op_name_for_schema(schema)
+
+        result_types = self._unpack_node_result_types(node, schema)
+        if len(result_types) > 1:
+            self._multi_result_nodes.add(node)
+
+        operands = []
+        for i, parameter in enumerate(schema.arguments):
+            if i < len(wrapped_args):
+                operands.append(
+                    self._import_argument(loc, wrapped_args[i], parameter.type)
+                )
+            elif parameter.name in node.kwargs:
+                operands.append(
+                    self._import_argument(
+                        loc, node.kwargs[parameter.name], parameter.type
+                    )
+                )
+            else:
+                operands.append(
+                    self._import_default_value(
+                        loc, parameter.default_value, parameter.type
+                    )
+                )
+
+        operation = _emit_operation(
+            mlir_op_name,
+            result_types=result_types,
+            operands=operands,
+            loc=loc,
+        )
+        for i, value in enumerate(operation.results):
+            self.bind_node_value(node, value, i)
+
     def _import_hop_while_loop(
         self, loc: Location, node: torch_fx.Node, hop: HigherOrderOperator
     ):
@@ -2498,31 +2562,52 @@ def create_mlir_tensor_type(tensor: torch.Tensor) -> IrType:
     return _create_mlir_tensor_type(tensor.dtype, tensor.size())
 
 
+def _dtype_is(dtype: torch.dtype, name: str) -> bool:
+    return hasattr(torch, name) and dtype == getattr(torch, name)
+
+
+def _is_byte_float_dtype(dtype: torch.dtype) -> bool:
+    return any(
+        _dtype_is(dtype, name)
+        for name in (
+            "float8_e4m3fn",
+            "float8_e5m2",
+            "float8_e4m3fnuz",
+            "float8_e5m2fnuz",
+            "float8_e8m0fnu",
+        )
+    )
+
+
+def _is_packed_byte_transport_dtype(dtype: torch.dtype) -> bool:
+    return _dtype_is(dtype, "float4_e2m1fn_x2")
+
+
+def _to_numpy_transport_array(tensor: torch.Tensor) -> tuple[np.ndarray, bool]:
+    if tensor.dtype == torch.bfloat16:
+        return np.array(tensor.view(torch.int16).tolist(), dtype=np.int16), True
+    if _is_byte_float_dtype(tensor.dtype) or _is_packed_byte_transport_dtype(
+        tensor.dtype
+    ):
+        return np.array(tensor.view(torch.uint8).tolist(), dtype=np.uint8), True
+
+    npy_dtype = TORCH_DTYPE_TO_NPY_TYPE.get(tensor.dtype)
+    assert (
+        npy_dtype is not None
+    ), f"Can not create literal tensor for unsupported datatype: {tensor.dtype}"
+    return np.array(tensor.tolist()).astype(npy_dtype), False
+
+
 def _make_vtensor_literal_op(
     tensor: torch.Tensor, vtensor_type: IrType, py_attr_tracker: "RefTracker"
 ) -> Operation:
     mapping = py_attr_tracker.track(tensor)
     if mapping.is_empty:
-        # check support for bfloat16
-        assert not (
-            tensor.dtype == torch.bfloat16 and ml_dtypes is None
-        ), f"torch.bfloat16 requires the ml_dtypes package, please run:\n\npip install ml_dtypes\n"
-        # Resolve the attribute.
-        npy_dtype = TORCH_DTYPE_TO_NPY_TYPE.get(tensor.dtype)
-        assert (
-            npy_dtype is not None
-        ), f"Can not create literal tensor for unsupported datatype: {tensor.dtype}"
-        # We need a raw buffer of data in order to create an ElementsAttr for the invocation of torch.vtensor.literal,
-        # but torch.Tensor does not fulfill the python buffer/array interface hence we must convert to a numpy array to get
-        # a raw buffer of our data. We can't call torch.Tensor.numpy() directly because this internally forces a call to
-        # detach() which throws an error as we are operating in a FakeTensorMode, hence the simplest way to get this raw
-        # buffer is via the indirection: Tensor -> list -> numpy array. This allows us to create a vtensor literal as
-        # desired, but also limits which data types we can support in this function (see TORCH_DTYPE_TO_NPY_TYPE above)
-        np_tensor = np.array(tensor.tolist()).astype(npy_dtype)
+        np_tensor, use_transport_buffer = _to_numpy_transport_array(tensor)
         # One element constants are more optimizable as splat DenseElementsAttr. DenseResourceElementsAttr does not
         # support splats, so don't use it for that case. In addition, at the time of writing, it has bugs with handling
         # 0d tensors.
-        if np_tensor.size == 1:
+        if np_tensor.size == 1 and not use_transport_buffer:
             try:
                 dtype = tensor.dtype
                 element_type = TORCH_DTYPE_TO_MLIR_TYPE[dtype]()
