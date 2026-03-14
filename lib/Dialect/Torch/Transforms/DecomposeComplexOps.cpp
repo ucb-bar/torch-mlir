@@ -2530,6 +2530,72 @@ static Value getSoftmaxResult(Operation *op, Value self, Value dim,
   return result;
 }
 
+namespace {
+// Fold a trailing convert_element_type(softmax(...)) into a low-precision
+// softmax directly, so decomposition can stay in the target element type.
+class FoldSoftmaxIntConvertElementTypeOp
+    : public OpRewritePattern<PrimsConvertElementTypeOp> {
+public:
+  explicit FoldSoftmaxIntConvertElementTypeOp(MLIRContext *context)
+      : OpRewritePattern<PrimsConvertElementTypeOp>(context,
+                                                    /*benefit=*/2) {}
+
+  LogicalResult matchAndRewrite(PrimsConvertElementTypeOp op,
+                                PatternRewriter &rewriter) const override {
+    auto softmaxOp = op.getA().getDefiningOp<AtenSoftmaxIntOp>();
+    if (!softmaxOp || !softmaxOp->hasOneUse()) {
+      return rewriter.notifyMatchFailure(op, "expected single-use softmax");
+    }
+    if (!isa<Torch::NoneType>(softmaxOp.getDtype().getType())) {
+      return rewriter.notifyMatchFailure(op,
+                                         "softmax dtype override unsupported");
+    }
+
+    auto softmaxResultType = dyn_cast<BaseTensorType>(softmaxOp.getType());
+    auto convertResultType = dyn_cast<BaseTensorType>(op.getType());
+    if (!softmaxResultType || !convertResultType ||
+        !softmaxResultType.hasDtype() || !convertResultType.hasDtype()) {
+      return rewriter.notifyMatchFailure(op, "expected tensor types with dtype");
+    }
+    Type srcDType = softmaxResultType.getDtype();
+    Type dstDType = convertResultType.getDtype();
+    if (!srcDType.isF32() || (!dstDType.isBF16() && !dstDType.isF16())) {
+      return rewriter.notifyMatchFailure(
+          op, "expected f32 softmax converted to bf16/f16");
+    }
+
+    Value softmaxInput = softmaxOp.getSelf();
+    auto softmaxInputType = dyn_cast<BaseTensorType>(softmaxInput.getType());
+    if (!softmaxInputType || !softmaxInputType.hasDtype()) {
+      return rewriter.notifyMatchFailure(op, "expected softmax input dtype");
+    }
+
+    Location loc = op.getLoc();
+    Value lowPrecisionInput = softmaxInput;
+    if (softmaxInputType.getDtype() != dstDType) {
+      Value cstFalse = ConstantBoolOp::create(rewriter, loc, false);
+      Value cstNone = ConstantNoneOp::create(rewriter, loc);
+      Type lowPrecisionInputType = softmaxInputType.getWithSizesAndDtype(
+          softmaxInputType.getSizes(), dstDType);
+      lowPrecisionInput = AtenToDtypeOp::create(
+          rewriter, loc, lowPrecisionInputType, softmaxInput, op.getDtype(),
+          /*nonBlocking=*/cstFalse, /*copy=*/cstFalse,
+          /*memoryFormat=*/cstNone);
+    }
+
+    Value newSoftmax = AtenSoftmaxIntOp::create(rewriter, loc, op.getType(),
+                                                lowPrecisionInput,
+                                                softmaxOp.getDim(),
+                                                softmaxOp.getDtype());
+    rewriter.replaceOp(op, newSoftmax);
+    if (softmaxOp->use_empty()) {
+      rewriter.eraseOp(softmaxOp);
+    }
+    return success();
+  }
+};
+} // namespace
+
 // Decompose softmax into: exp(x) / sum(exp(x))
 namespace {
 class DecomposeAtenSoftmaxIntOp : public OpRewritePattern<AtenSoftmaxIntOp> {
@@ -2548,6 +2614,59 @@ public:
       return rewriter.notifyMatchFailure(op,
                                          "Only support floating-point type");
 
+    // Fast path: if this softmax feeds a single low-precision cast
+    // (f32 -> bf16/f16), decompose directly in low precision and replace the
+    // cast user.
+    if (op->hasOneUse()) {
+      Operation *user = *op->user_begin();
+      BaseTensorType castResultType = nullptr;
+      Type castResultDType = nullptr;
+      Value castDTypeInt = nullptr;
+      if (auto convertOp = dyn_cast<PrimsConvertElementTypeOp>(user)) {
+        castResultType = cast<BaseTensorType>(convertOp.getType());
+        if (castResultType.hasDtype()) {
+          castResultDType = castResultType.getDtype();
+          castDTypeInt = convertOp.getDtype();
+        }
+      } else if (auto toDTypeOp = dyn_cast<AtenToDtypeOp>(user)) {
+        castResultType = cast<BaseTensorType>(toDTypeOp.getType());
+        if (castResultType.hasDtype()) {
+          castResultDType = castResultType.getDtype();
+          castDTypeInt = toDTypeOp.getDtype();
+        }
+      }
+
+      if (castResultType && castResultDType &&
+          (castResultDType.isBF16() || castResultDType.isF16())) {
+        Location loc = op.getLoc();
+        Value lowPrecisionSelf = self;
+        auto selfType = cast<BaseTensorType>(self.getType());
+        if (!selfType.hasDtype()) {
+          return rewriter.notifyMatchFailure(op, "expected input dtype");
+        }
+        if (selfType.getDtype() != castResultDType) {
+          Value cstFalse = ConstantBoolOp::create(rewriter, loc, false);
+          Value none = ConstantNoneOp::create(rewriter, loc);
+          Type lowPrecisionSelfType = selfType.getWithSizesAndDtype(
+              selfType.getSizes(), castResultDType);
+          lowPrecisionSelf = AtenToDtypeOp::create(
+              rewriter, loc, lowPrecisionSelfType, self, castDTypeInt,
+              /*non_blocking=*/cstFalse, /*copy=*/cstFalse,
+              /*memory_format=*/none);
+        }
+
+        Value lowPrecisionResult = getSoftmaxResult(
+            op.getOperation(), lowPrecisionSelf, op.getDim(), castResultType,
+            castResultDType, rewriter);
+        if (!lowPrecisionResult) {
+          return failure();
+        }
+        rewriter.replaceOp(user, lowPrecisionResult);
+        rewriter.eraseOp(op);
+        return success();
+      }
+    }
+
     // If `dtype` arg is non-none then convert the input to `dtype`.
     if (!isa<Torch::NoneType>(op.getDtype().getType())) {
       Location loc = op.getLoc();
@@ -2560,6 +2679,9 @@ public:
     }
 
     Type accumulatorTensorType = getDefaultAccType(rewriter, resultTensorDtype);
+    if (resultTensorDtype.isBF16() || resultTensorDtype.isF16()) {
+      accumulatorTensorType = resultTensorDtype;
+    }
 
     Value result =
         getSoftmaxResult(op.getOperation(), self, op.getDim(), resultTensorType,
@@ -2610,6 +2732,9 @@ public:
     }
 
     Type accumulatorTensorType = getDefaultAccType(rewriter, resultTensorDtype);
+    if (resultTensorDtype.isBF16() || resultTensorDtype.isF16()) {
+      accumulatorTensorType = resultTensorDtype;
+    }
 
     Value result =
         getSoftmaxResult(op.getOperation(), self, op.getDim(), resultTensorType,
@@ -8821,6 +8946,109 @@ public:
 } // namespace
 
 namespace {
+struct MxLinearWeightPattern {
+  Value rhs;
+  Value scales;
+  int64_t groupSize;
+};
+
+// Matches MX-style weight materialization:
+//   view(mul(view(convert_element_type(f8_weight, bf16)), unsqueeze(scales)))
+// and extracts (f8_weight, scales, groupSize).
+static FailureOr<MxLinearWeightPattern> matchMxLinearWeightPattern(Value weight) {
+  auto view2D = dyn_cast_or_null<AtenViewOp>(weight.getDefiningOp());
+  if (!view2D)
+    return failure();
+
+  auto mulOp = dyn_cast_or_null<AtenMulTensorOp>(view2D.getSelf().getDefiningOp());
+  if (!mulOp)
+    return failure();
+
+  auto weightView3D = dyn_cast_or_null<AtenViewOp>(mulOp.getSelf().getDefiningOp());
+  auto scalesUnsqueeze =
+      dyn_cast_or_null<AtenUnsqueezeOp>(mulOp.getOther().getDefiningOp());
+  if (!weightView3D || !scalesUnsqueeze) {
+    weightView3D =
+        dyn_cast_or_null<AtenViewOp>(mulOp.getOther().getDefiningOp());
+    scalesUnsqueeze =
+        dyn_cast_or_null<AtenUnsqueezeOp>(mulOp.getSelf().getDefiningOp());
+  }
+  if (!weightView3D || !scalesUnsqueeze)
+    return failure();
+
+  Operation *convertOrCastOp = weightView3D.getSelf().getDefiningOp();
+  Value rhsValue;
+  if (auto convertOp = dyn_cast_or_null<PrimsConvertElementTypeOp>(convertOrCastOp)) {
+    rhsValue = convertOp.getA();
+  } else if (auto toDtypeOp = dyn_cast_or_null<AtenToDtypeOp>(convertOrCastOp)) {
+    rhsValue = toDtypeOp.getSelf();
+  } else {
+    return failure();
+  }
+
+  auto rhsType = dyn_cast<ValueTensorType>(rhsValue.getType());
+  auto convertedType = dyn_cast<ValueTensorType>(weightView3D.getSelf().getType());
+  if (!rhsType || !convertedType || !rhsType.hasDtype() ||
+      !convertedType.hasDtype()) {
+    return failure();
+  }
+
+  auto rhsDtype = dyn_cast<::mlir::FloatType>(rhsType.getDtype());
+  auto convertedDtype = dyn_cast<::mlir::FloatType>(convertedType.getDtype());
+  if (!rhsDtype || rhsDtype.getWidth() != 8 || !convertedDtype ||
+      convertedDtype.getWidth() != 16) {
+    return failure();
+  }
+
+  if (!rhsType.hasSizes())
+    return failure();
+  auto rhsSizes = rhsType.getSizes();
+  if (rhsSizes.size() != 2 || rhsSizes[0] == kUnknownSize ||
+      rhsSizes[1] == kUnknownSize) {
+    return failure();
+  }
+
+  int64_t unsqueezeDim = 0;
+  if (!matchPattern(scalesUnsqueeze.getDim(), m_TorchConstantInt(&unsqueezeDim)) ||
+      (unsqueezeDim != -1 && unsqueezeDim != 2)) {
+    return failure();
+  }
+
+  SmallVector<int64_t> expandedWeightShape;
+  if (!matchPattern(weightView3D.getSize(),
+                    m_TorchListOfConstantInts(expandedWeightShape)) ||
+      expandedWeightShape.size() != 3 || expandedWeightShape[2] <= 0) {
+    return failure();
+  }
+  if (expandedWeightShape[0] != rhsSizes[0] ||
+      expandedWeightShape[1] * expandedWeightShape[2] != rhsSizes[1]) {
+    return failure();
+  }
+
+  SmallVector<int64_t> collapsedWeightShape;
+  if (!matchPattern(view2D.getSize(),
+                    m_TorchListOfConstantInts(collapsedWeightShape)) ||
+      collapsedWeightShape.size() != 2) {
+    return failure();
+  }
+  if (collapsedWeightShape[0] != rhsSizes[0] ||
+      collapsedWeightShape[1] != rhsSizes[1]) {
+    return failure();
+  }
+
+  auto scalesType = dyn_cast<ValueTensorType>(scalesUnsqueeze.getType());
+  if (!scalesType || !scalesType.hasSizes())
+    return failure();
+  auto scalesSizes = scalesType.getSizes();
+  if (scalesSizes.size() != 3 || scalesSizes[0] != rhsSizes[0] ||
+      scalesSizes[1] != expandedWeightShape[1] || scalesSizes[2] != 1) {
+    return failure();
+  }
+
+  return MxLinearWeightPattern{rhsValue, scalesUnsqueeze.getResult(),
+                               expandedWeightShape[2]};
+}
+
 // Decompose `aten.linear` op into `aten.matmul` and `aten.add` ops.
 class DecomposeAtenLinearOp : public OpRewritePattern<AtenLinearOp> {
 public:
@@ -8839,6 +9067,52 @@ public:
     BaseTensorType weightType = cast<BaseTensorType>(weight.getType());
     if (!weightType.hasSizes())
       return rewriter.notifyMatchFailure(op, "expected weight to have sizes");
+
+    if (FailureOr<MxLinearWeightPattern> mxPattern =
+            matchMxLinearWeightPattern(weight);
+        succeeded(mxPattern)) {
+      // ConvertCustomQuantizedMatmulOp currently lowers rank-3 lhs inputs.
+      // Keep other ranks on the standard aten.linear decomposition path.
+      if (inputType.getSizes().size() != 3) {
+        // Fall through to default aten.linear decomposition.
+      } else {
+      auto rhsType = cast<ValueTensorType>(mxPattern->rhs.getType());
+      if (!rhsType.hasDtype()) {
+        return rewriter.notifyMatchFailure(
+            op, "expected MX rhs tensor to have a dtype");
+      }
+
+      int64_t rhsBitWidth = rhsType.getDtype().getIntOrFloatBitWidth();
+      Value bitWidth = ConstantIntOp::create(
+          rewriter, loc, rewriter.getType<Torch::IntType>(),
+          rewriter.getI64IntegerAttr(rhsBitWidth));
+      Value groupSize = ConstantIntOp::create(
+          rewriter, loc, rewriter.getType<Torch::IntType>(),
+          rewriter.getI64IntegerAttr(mxPattern->groupSize));
+
+      SmallVector<Value> quantOperands = {input, mxPattern->rhs,
+                                          mxPattern->scales, mxPattern->scales,
+                                          bitWidth, groupSize};
+      SmallVector<NamedAttribute> quantAttrs = {
+          rewriter.getNamedAttr("name",
+                                rewriter.getStringAttr(
+                                    "quant.matmul_rhs_group_quant"))};
+      Value quantMatmul = OperatorOp::create(rewriter, loc, op.getType(),
+                                             quantOperands, quantAttrs, 0)
+                              .getResult(0);
+
+      if (isa<Torch::NoneType>(bias.getType())) {
+        rewriter.replaceOp(op, quantMatmul);
+        return success();
+      }
+
+      Value alpha =
+          ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(1));
+      rewriter.replaceOpWithNewOp<AtenAddTensorOp>(op, op.getType(),
+                                                   quantMatmul, bias, alpha);
+      return success();
+      }
+    }
 
     auto transposeWeight = [&]() -> Value {
       SmallVector<int64_t> transposeShape =
@@ -12052,6 +12326,22 @@ public:
 };
 } // namespace
 
+namespace {
+// Decompose `aten.__and__.Tensor` into `aten.logical_and`.
+class DecomposeAtenBitwiseAndTensorOp
+    : public OpRewritePattern<Aten__And__TensorOp> {
+public:
+  using OpRewritePattern<Aten__And__TensorOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(Aten__And__TensorOp op,
+                                PatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<AtenLogicalAndOp>(op, op.getType(), op.getSelf(),
+                                                  op.getOther());
+    return success();
+  }
+};
+} // namespace
+
 // Torch ops related to indexing tensors, e.g., AtenIndexTensor, AtenIndexPut.
 namespace {
 
@@ -12177,6 +12467,181 @@ static FailureOr<Value> createNewIndices(Operation *op,
   return newIndexList;
 }
 
+static FailureOr<Value> getSingleBoolMaskFromIndices(Value indices) {
+  SmallVector<Value> indicesValues;
+  if (!getListConstructElements(indices, indicesValues) ||
+      indicesValues.size() != 1) {
+    return failure();
+  }
+
+  auto maskType = dyn_cast<BaseTensorType>(indicesValues.front().getType());
+  if (!maskType || !maskType.hasDtype()) {
+    return failure();
+  }
+  auto dtype = dyn_cast<IntegerType>(maskType.getDtype());
+  if (!dtype || dtype.getWidth() != 1) {
+    return failure();
+  }
+
+  return indicesValues.front();
+}
+
+static bool areEquivalentMaskValues(Value lhs, Value rhs) {
+  if (lhs == rhs) {
+    return true;
+  }
+
+  auto lhsView = lhs.getDefiningOp<AtenViewOp>();
+  auto rhsView = rhs.getDefiningOp<AtenViewOp>();
+  if (!lhsView || !rhsView || lhsView.getSelf() != rhsView.getSelf()) {
+    return false;
+  }
+
+  SmallVector<int64_t> lhsShape;
+  SmallVector<int64_t> rhsShape;
+  return matchPattern(lhsView.getSize(), m_TorchListOfConstantInts(lhsShape)) &&
+         matchPattern(rhsView.getSize(), m_TorchListOfConstantInts(rhsShape)) &&
+         lhsShape == rhsShape;
+}
+
+static LogicalResult
+getSourceAndMaskFromIndexValue(Value indexedValues, Value &source, Value &mask) {
+  if (auto indexOp = indexedValues.getDefiningOp<AtenIndexTensorOp>()) {
+    auto maybeMask = getSingleBoolMaskFromIndices(indexOp.getIndices());
+    if (failed(maybeMask)) {
+      return failure();
+    }
+    source = indexOp.getSelf();
+    mask = *maybeMask;
+    return success();
+  }
+
+  if (auto indexOp =
+          indexedValues.getDefiningOp<AtenIndexTensorHackedTwinOp>()) {
+    auto maybeMask = getSingleBoolMaskFromIndices(indexOp.getIndices());
+    if (failed(maybeMask)) {
+      return failure();
+    }
+    source = indexOp.getSelf();
+    mask = *maybeMask;
+    return success();
+  }
+
+  return failure();
+}
+
+static bool isAssertOnlySizeUse(Value sizeValue,
+                                std::optional<int64_t> staticNumel) {
+  for (Operation *user : sizeValue.getUsers()) {
+    if (isa<AtenSymConstrainRangeForSizeOp>(user)) {
+      continue;
+    }
+
+    Operation *cmp = user;
+    int64_t bound = 0;
+    if (auto ge = dyn_cast<AtenGeIntOp>(cmp)) {
+      if (ge.getA() != sizeValue ||
+          !matchPattern(ge.getB(), m_TorchConstantInt(&bound)) ||
+          bound != 0) {
+        return false;
+      }
+    } else if (auto le = dyn_cast<AtenLeIntOp>(cmp)) {
+      if (le.getA() != sizeValue ||
+          !matchPattern(le.getB(), m_TorchConstantInt(&bound)) ||
+          !staticNumel.has_value() || bound < *staticNumel) {
+        return false;
+      }
+    } else {
+      return false;
+    }
+
+    if (!cmp->hasOneUse()) {
+      return false;
+    }
+    auto intBool = dyn_cast<AtenIntBoolOp>(*cmp->user_begin());
+    if (!intBool || !intBool->hasOneUse()) {
+      return false;
+    }
+    if (!isa<Aten_AssertScalarOp>(*intBool->user_begin())) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+template <typename AtenIndexPutLikeOpT>
+static LogicalResult rewriteBooleanMaskIndexPutToWhere(
+    AtenIndexPutLikeOpT op, PatternRewriter &rewriter) {
+  bool accumulate = true;
+  if (!matchPattern(op.getAccumulate(), m_TorchConstantBool(&accumulate)) ||
+      accumulate) {
+    return failure();
+  }
+
+  auto maybePutMask = getSingleBoolMaskFromIndices(op.getIndices());
+  if (failed(maybePutMask)) {
+    return failure();
+  }
+  Value putMask = *maybePutMask;
+
+  Value source;
+  Value valueMask;
+  if (failed(getSourceAndMaskFromIndexValue(op.getValues(), source, valueMask)) ||
+      !areEquivalentMaskValues(putMask, valueMask)) {
+    return failure();
+  }
+
+  auto selfType = dyn_cast<BaseTensorType>(op.getSelf().getType());
+  auto sourceType = dyn_cast<BaseTensorType>(source.getType());
+  auto maskType = dyn_cast<BaseTensorType>(putMask.getType());
+  if (!selfType || !sourceType || !maskType || !selfType.hasDtype() ||
+      !sourceType.hasDtype() || selfType.getDtype() != sourceType.getDtype()) {
+    return failure();
+  }
+  if (selfType.hasSizes() && sourceType.hasSizes() &&
+      selfType.getSizes() != sourceType.getSizes()) {
+    return failure();
+  }
+  if (maskType.hasSizes() && selfType.hasSizes() &&
+      maskType.getSizes() != selfType.getSizes()) {
+    return failure();
+  }
+
+  SmallVector<AtenSizeIntOp> sizeOpsToRewrite;
+  for (Operation *user : op.getValues().getUsers()) {
+    if (user == op.getOperation()) {
+      continue;
+    }
+    auto sizeOp = dyn_cast<AtenSizeIntOp>(user);
+    if (!sizeOp) {
+      return failure();
+    }
+
+    int64_t dim = 0;
+    if (!matchPattern(sizeOp.getDim(), m_TorchConstantInt(&dim)) || dim != 0) {
+      return failure();
+    }
+    sizeOpsToRewrite.push_back(sizeOp);
+  }
+
+  for (AtenSizeIntOp sizeOp : sizeOpsToRewrite) {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(sizeOp);
+    Value numel = AtenNumelOp::create(rewriter, sizeOp.getLoc(), putMask);
+    rewriter.replaceOp(sizeOp, numel);
+  }
+
+  rewriter.replaceOpWithNewOp<AtenWhereSelfOp>(op, op.getType(), putMask,
+                                                source, op.getSelf());
+
+  if (Operation *valuesDef = op.getValues().getDefiningOp();
+      valuesDef && valuesDef->use_empty()) {
+    rewriter.eraseOp(valuesDef);
+  }
+  return success();
+}
+
 // The goal of this pattern is to eliminate `None` index in aten.Index.Tensor's
 // `indices` param and transform it to aten.index.Tensor_hacked_twin, for the
 // ease of various backend.
@@ -12293,6 +12758,10 @@ public:
 
   LogicalResult matchAndRewrite(AtenIndexPutLikeOpT op,
                                 PatternRewriter &rewriter) const override {
+    if (succeeded(rewriteBooleanMaskIndexPutToWhere(op, rewriter))) {
+      return success();
+    }
+
     Location loc = op.getLoc();
     SmallVector<Value> indices;
     if (!getListConstructElements(op.getIndices(), indices))
@@ -12360,6 +12829,18 @@ public:
         op, op.getType(), input, *newIndicesInfo, op.getValues(),
         op.getAccumulate());
     return success();
+  }
+};
+
+template <typename AtenIndexPutLikeOpT>
+class DecomposeBooleanMaskIndexPutLikeOp
+    : public OpRewritePattern<AtenIndexPutLikeOpT> {
+public:
+  using OpRewritePattern<AtenIndexPutLikeOpT>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(AtenIndexPutLikeOpT op,
+                                PatternRewriter &rewriter) const override {
+    return rewriteBooleanMaskIndexPutToWhere(op, rewriter);
   }
 };
 } // namespace
@@ -13378,6 +13859,8 @@ public:
 
     addPatternIfTargetOpIsIllegal<DecomposeAten_WeightNormInterfaceOp>(
         patterns);
+    addPatternIfTargetOpIsIllegal<FoldSoftmaxIntConvertElementTypeOp>(
+        patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenSoftmaxIntOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAten_SoftmaxOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAten_SafeSoftmaxOp>(patterns);
@@ -13531,6 +14014,14 @@ public:
     addPatternIfTargetOpIsIllegal<DecomposeAtenDropoutOp>(patterns);
     addPatternIfTargetOpIsIllegal<DeomposeAtenNativeDropoutOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenNewEmptyOp>(patterns);
+    patterns.add<DecomposeBooleanMaskIndexPutLikeOp<AtenIndexPutOp>>(context);
+    patterns.add<DecomposeBooleanMaskIndexPutLikeOp<AtenIndexPutHackedTwinOp>>(
+        context);
+    patterns.add<
+        DecomposeBooleanMaskIndexPutLikeOp<Aten_UnsafeIndexPutHackedTwinOp>>(
+        context);
+    patterns.add<DecomposeBooleanMaskIndexPutLikeOp<Aten_IndexPutImplOp>>(
+        context);
     addPatternIfTargetOpIsIllegal<DecomposeAtenIndexTensorOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenIndexPutLikeOp<AtenIndexPutOp>>(
         patterns);
@@ -13629,6 +14120,7 @@ public:
     addPatternIfTargetOpIsIllegal<DecomposeAtenSgnOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposePrimsSumOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenTypeAsOp>(patterns);
+    addPatternIfTargetOpIsIllegal<DecomposeAtenBitwiseAndTensorOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenTileOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenReshapeAsOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenTriuOp>(patterns);
