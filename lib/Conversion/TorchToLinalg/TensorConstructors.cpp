@@ -414,15 +414,12 @@ public:
                 "memory_format is supported");
     }
 
-    // TODO: Add support for device arg other than cpu.
+    // Device placement does not affect value semantics at this stage.
     if (!isa<Torch::NoneType>(op.getDevice().getType())) {
       std::string device;
       if (!matchPattern(op.getDevice(), m_TorchConstantDevice(device)))
         return rewriter.notifyMatchFailure(
             op, "unimplemented: device must be a constant str");
-      else if (device != "cpu")
-        return rewriter.notifyMatchFailure(
-            op, "unimplemented: device is expected to be cpu");
     }
 
     // TODO: Add support for non-strided layout.
@@ -470,9 +467,23 @@ public:
       resultElementType = *maybeResultElementType;
     }
 
-    // Create an uninitialized tensor of `resultSize` shape.
+    if (static_cast<int64_t>(resultSizeIndex.size()) != resultType.getRank()) {
+      return rewriter.notifyMatchFailure(
+          op, "unimplemented: size rank must match result tensor rank");
+    }
+
+    SmallVector<Value> dynamicDims;
+    dynamicDims.reserve(resultType.getNumDynamicDims());
+    for (int64_t i = 0; i < resultType.getRank(); ++i) {
+      if (resultType.isDynamicDim(i)) {
+        dynamicDims.push_back(resultSizeIndex[i]);
+      }
+    }
+
+    // Create an uninitialized tensor with the statically known rank and only
+    // pass dynamic dimensions to avoid malformed mixed static/dynamic shapes.
     Value initTensor = tensor::EmptyOp::create(
-        rewriter, loc, getAsOpFoldResult(resultSizeIndex), resultElementType);
+        rewriter, loc, resultType.getShape(), resultElementType, dynamicDims);
     rewriter.replaceOpWithNewOp<tensor::CastOp>(op, resultType, initTensor);
     return success();
   }

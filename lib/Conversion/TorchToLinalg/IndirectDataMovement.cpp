@@ -596,6 +596,11 @@ public:
       // Because we are assuming static shapes, we can get the shape of the
       // broadcasted index tensors from the shape refinement pass
       auto refinedResultShape = resultType.getShape();
+      if (startIndex + maxRank > resultRank) {
+        return rewriter.notifyMatchFailure(
+            op,
+            "unimplemented: broadcasted index rank exceeds refined result rank");
+      }
       for (auto i : llvm::seq(startIndex, startIndex + maxRank)) {
         auto resultDimSize = refinedResultShape[i];
         if (ShapedType::isDynamic(resultDimSize)) {
@@ -644,6 +649,10 @@ public:
     // This result shape calculation assumes that there is only one
     // index tensor, or all of the index tensors are statically shaped.
     int broadcastRank = broadcastedIndexShape.size();
+    if (firstIndexDim + replacedIndexCount > inputRank) {
+      return rewriter.notifyMatchFailure(
+          op, "unimplemented: too many indexed dimensions for input rank");
+    }
 
     SmallVector<Value> resultShape;
     if (contiguous) {
@@ -651,6 +660,10 @@ public:
         resultShape.push_back(getDimOp(rewriter, loc, input, i));
       }
       resultShape.append(broadcastedIndexShape);
+      if (static_cast<int>(resultShape.size()) > resultRank) {
+        return rewriter.notifyMatchFailure(
+            op, "unimplemented: computed result rank exceeds expected rank");
+      }
       for (auto i : llvm::seq((int)resultShape.size(), resultRank)) {
         resultShape.push_back(getDimOp(rewriter, loc, input,
                                        i - broadcastRank + replacedIndexCount));
@@ -688,8 +701,12 @@ public:
           indicesExpr.push_back(rewriter.getAffineConstantExpr(0));
           continue;
         }
-        indicesExpr.push_back(
-            rewriter.getAffineDimExpr(startIndex + broadcastRank - rank + dim));
+        int affineDim = startIndex + broadcastRank - rank + dim;
+        if (affineDim < 0 || affineDim >= resultRank) {
+          return rewriter.notifyMatchFailure(
+              op, "unimplemented: index tensor broadcast map is out of bounds");
+        }
+        indicesExpr.push_back(rewriter.getAffineDimExpr(affineDim));
       }
       indexingMaps.push_back(
           AffineMap::get(resultRank, 0, indicesExpr, op->getContext()));
